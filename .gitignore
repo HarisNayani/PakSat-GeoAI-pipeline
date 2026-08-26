@@ -1,0 +1,17 @@
+# Python environment
+venv/
+__pycache__/
+*.pyc
+
+# ML Models & Large Binaries (keep code lightweight)
+*.pkl
+*.h5
+
+# OS & IDE junk
+.DS_Store
+.vscode/
+.idea/
+
+# Secret tokens
+.env
+gcp_credentials.json
