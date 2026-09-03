@@ -10,6 +10,7 @@ import folium
 import numpy as np
 import pandas as pd
 import streamlit as st
+from branca.element import Element
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 
@@ -99,7 +100,8 @@ def demo_data() -> pd.DataFrame:
 
 
 def make_map(data: pd.DataFrame, latitude: float, longitude: float) -> folium.Map:
-    air_map = folium.Map(location=[latitude, longitude], zoom_start=5, tiles="CartoDB positron")
+    # OpenStreetMap is public and does not require a tile API key.
+    air_map = folium.Map(location=[latitude, longitude], zoom_start=5, tiles="OpenStreetMap", control_scale=True)
     heat_points = data[["latitude", "longitude", "pm25"]].dropna().values.tolist()
     if heat_points:
         HeatMap(heat_points, radius=28, blur=20, min_opacity=0.35).add_to(air_map)
@@ -110,6 +112,12 @@ def make_map(data: pd.DataFrame, latitude: float, longitude: float) -> folium.Ma
             [row.latitude, row.longitude], radius=7, color=color, fill=True,
             fill_opacity=0.85, tooltip=f"{row.city}: {row.pm25:.1f} ug/m3 (upper {upper:.1f})",
         ).add_to(air_map)
+    air_map.get_root().html.add_child(Element(
+        '<div style="background:#fff;padding:8px 10px;border:1px solid #999;line-height:1.5">'
+        '<b>PM2.5 (ug/m3)</b><br><span style="color:#16803c">&#9679;</span> &lt; 55 '
+        '<span style="color:#f08c00">&#9679;</span> 55-150 '
+        '<span style="color:#d62828">&#9679;</span> &gt; 150</div>'
+    ))
     folium.Marker([latitude, longitude], tooltip="Selected location", icon=folium.Icon(color="blue")).add_to(air_map)
     return air_map
 
