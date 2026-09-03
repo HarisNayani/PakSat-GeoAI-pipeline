@@ -7,3 +7,5 @@ requests>=2.31.0
 scikit-learn>=1.4.0
 streamlit>=1.36.0
 streamlit-folium>=0.22.0
+oss2>=2.18.6
+psycopg[binary]>=3.2.0

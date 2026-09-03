@@ -12,9 +12,10 @@ def assess_clinical_risk(pm25_level: float, patient_symptoms: Iterable[str]) -> 
     """Return explainable environmental risk guidance, not a medical diagnosis."""
     level = float(pm25_level)
     symptoms = {str(symptom).strip().lower() for symptom in patient_symptoms if symptom}
-    respiratory = {"cough", "wheezing", "shortness of breath", "chest tightness"}
+    respiratory = {"cough", "wheezing", "shortness of breath", "chest tightness", "severe breathing difficulty", "blue lips"}
+    urgent_symptoms = symptoms.intersection({"severe breathing difficulty", "blue lips"})
 
-    if level > ACUTE_THRESHOLD:
+    if level > ACUTE_THRESHOLD or urgent_symptoms:
         severity = "Environmental Acute Exacerbation"
     elif level > 55 or symptoms.intersection(respiratory):
         severity = "Elevated Environmental Risk"
@@ -28,11 +29,11 @@ def assess_clinical_risk(pm25_level: float, patient_symptoms: Iterable[str]) -> 
         "Keep windows closed and use HEPA indoor filtration.",
         "Avoid strenuous outdoor activity while air quality is elevated.",
     ]
-    if symptoms.intersection({"wheezing", "shortness of breath", "chest tightness"}):
+    if symptoms.intersection({"wheezing", "shortness of breath", "chest tightness", "severe breathing difficulty", "blue lips"}):
         recommendations.append(
             "Follow the patient's existing action plan; seek urgent clinical assessment for worsening symptoms."
         )
-    if level > ACUTE_THRESHOLD:
+    if level > ACUTE_THRESHOLD or urgent_symptoms:
         recommendations.append(
             "Bronchodilator use should follow an existing prescription and clinician guidance; do not self-medicate."
         )
@@ -42,7 +43,7 @@ def assess_clinical_risk(pm25_level: float, patient_symptoms: Iterable[str]) -> 
         "severity": severity,
         "symptoms": sorted(symptoms),
         "recommendations": recommendations,
-        "urgent": level > ACUTE_THRESHOLD or bool(symptoms.intersection({"severe breathing difficulty", "blue lips"})),
+        "urgent": level > ACUTE_THRESHOLD or bool(urgent_symptoms),
         "disclaimer": "Decision support only. Contact local emergency services for severe symptoms.",
     }
 

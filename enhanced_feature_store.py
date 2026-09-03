@@ -1,0 +1,68 @@
+"""Vectorized physics-informed feature store for PakSat telemetry."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+
+import numpy as np
+import pandas as pd
+
+BASE_COLUMNS = ("wind_speed", "pblh", "temperature", "relative_humidity", "NO2_density", "AOD_047")
+DERIVED_COLUMNS = ("atmospheric_stagnation_index", "thermal_confinement_ratio", "photochemical_pm25_proxy", "hygroscopic_growth_factor", "lag_24h", "lag_48h")
+MODEL_COLUMNS = ("AOD_047", "NO2_density", "temperature", "relative_humidity", "wind_speed", "pblh", *DERIVED_COLUMNS)
+
+
+def _numeric(frame: pd.DataFrame, column: str) -> pd.Series:
+    return pd.to_numeric(frame[column], errors="coerce")
+
+
+def add_physics_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Add bounded physics features without mutating the input frame."""
+    missing = set(BASE_COLUMNS).difference(frame.columns)
+    if missing:
+        raise ValueError(f"Missing required telemetry columns: {sorted(missing)}")
+    result = frame.copy()
+    wind = _numeric(result, "wind_speed").clip(lower=1e-6)
+    pblh = _numeric(result, "pblh").clip(lower=1e-6)
+    temperature = _numeric(result, "temperature")
+    humidity = _numeric(result, "relative_humidity")
+    humidity = humidity.where(humidity <= 1.0, humidity / 100.0).clip(0.0, 0.99)
+    result["atmospheric_stagnation_index"] = 1000.0 / (wind * pblh + 1.0)
+    result["thermal_confinement_ratio"] = temperature / (pblh / 100.0)
+    result["photochemical_pm25_proxy"] = _numeric(result, "NO2_density") * temperature * _numeric(result, "AOD_047")
+    result["hygroscopic_growth_factor"] = 1.0 / (1.0 - humidity)
+    return result.replace([np.inf, -np.inf], np.nan)
+
+
+def add_spatiotemporal_lags(frame: pd.DataFrame, target: str = "pm25") -> pd.DataFrame:
+    """Compute 24/48-hour rolling persistence per city, ordered by timestamp."""
+    if target not in frame:
+        raise ValueError(f"Missing target column: {target}")
+    result = frame.copy()
+    result["timestamp"] = pd.to_datetime(result.get("timestamp"), errors="coerce", utc=True)
+    result["_target"] = pd.to_numeric(result[target], errors="coerce")
+    group_columns = ["city"] if "city" in result else []
+    result = result.sort_values(group_columns + ["timestamp"] if group_columns else ["timestamp"])
+    if result["timestamp"].notna().any():
+        grouped = result.set_index("timestamp").groupby(group_columns[0])["_target"] if group_columns else result.set_index("timestamp")["_target"]
+        for hours, name in ((24, "lag_24h"), (48, "lag_48h")):
+            rolled = grouped.rolling(f"{hours}h", min_periods=1).mean().reset_index(level=0, drop=True) if group_columns else grouped.rolling(f"{hours}h", min_periods=1).mean()
+            result[name] = rolled.reindex(result.set_index("timestamp").index).to_numpy()
+    else:
+        result["lag_24h"] = result.groupby(group_columns)["_target"].transform(lambda values: values.rolling(24, min_periods=1).mean()) if group_columns else result["_target"].rolling(24, min_periods=1).mean()
+        result["lag_48h"] = result.groupby(group_columns)["_target"].transform(lambda values: values.rolling(48, min_periods=1).mean()) if group_columns else result["_target"].rolling(48, min_periods=1).mean()
+    return result.drop(columns=["_target"]).sort_index()
+
+
+def prepare_features(frame: pd.DataFrame, feature_columns: Iterable[str] | None = None) -> pd.DataFrame:
+    """Return model-ready numeric features with linear interpolation and fallback fill."""
+    enriched = add_spatiotemporal_lags(add_physics_features(frame)) if "pm25" in frame else add_physics_features(frame)
+    columns = list(feature_columns or MODEL_COLUMNS)
+    missing = set(columns).difference(enriched.columns)
+    if missing:
+        raise ValueError(f"Missing model feature columns: {sorted(missing)}")
+    values = enriched[columns].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    return values.interpolate(limit_direction="both").ffill().bfill().fillna(0.0)
+
+
+__all__ = ["BASE_COLUMNS", "DERIVED_COLUMNS", "MODEL_COLUMNS", "add_physics_features", "add_spatiotemporal_lags", "prepare_features"]
