@@ -55,15 +55,37 @@ def train_and_evaluate(frame: pd.DataFrame, model_path: Path = MODEL_PATH) -> di
 
 
 def predict_with_uncertainty(artifact: dict[str, Any], frame: pd.DataFrame) -> pd.DataFrame:
-    """Return point, quantile bounds, and Gaussian-style 95% uncertainty."""
+    """Return point predictions and q05/q95 bounds when quantile models exist.
+
+    ``pm25_std`` is a normal-equivalent scale derived from the quantile span;
+    it is not a separately calibrated predictive standard deviation.
+    """
     columns = artifact.get("feature_columns", MODEL_COLUMNS)
     values = prepare_features(frame, columns)
-    models = artifact.get("models", {"0.5": artifact["model"]})
-    lower = np.asarray(models.get("0.05", models.get("0.05" , models["0.5"])).predict(values), dtype=float)
-    point = np.asarray(models.get("0.5", artifact["model"]).predict(values), dtype=float)
-    upper = np.asarray(models.get("0.95", models.get("0.5", artifact["model"])).predict(values), dtype=float)
-    std = np.maximum((upper - lower) / 3.92, 0.0)
-    return pd.DataFrame({"pm25_point": point, "pm25_lower": point - 1.96 * std, "pm25_upper": point + 1.96 * std, "pm25_std": std}, index=frame.index)
+    models = artifact.get("models") or {}
+    point_model = models.get("0.5", artifact["model"])
+    point = np.asarray(point_model.predict(values), dtype=float)
+    lower_model = models.get("0.05")
+    upper_model = models.get("0.95")
+    if lower_model is not None and upper_model is not None:
+        lower = np.asarray(lower_model.predict(values), dtype=float)
+        upper = np.asarray(upper_model.predict(values), dtype=float)
+        ordered_quantiles = np.sort(np.vstack([lower, point, upper]), axis=0)
+        lower, point, upper = ordered_quantiles
+        std = np.maximum((upper - lower) / 3.92, 0.0)
+    else:
+        lower = np.full_like(point, np.nan)
+        upper = np.full_like(point, np.nan)
+        std = np.full_like(point, np.nan)
+    return pd.DataFrame(
+        {
+            "pm25_point": point,
+            "pm25_lower": lower,
+            "pm25_upper": upper,
+            "pm25_std": std,
+        },
+        index=frame.index,
+    )
 
 
 def trigger_pai_retraining(endpoint: str | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:

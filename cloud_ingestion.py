@@ -15,9 +15,9 @@ from datetime import date, timedelta
 from typing import Any, Mapping
 
 import pandas as pd
-import requests
 
-from data_ingestion import CityRegion, PAKISTAN_REGIONS
+from data_ingestion import CityRegion, PAKISTAN_REGIONS, fetch_openaq_measurements
+from paksat.telemetry_normalization import normalize_earth_engine_features
 
 
 @dataclass(frozen=True)
@@ -109,25 +109,12 @@ class AnalyticDBPostGIS:
 
 
 def _openaq(region: CityRegion, start: date, end: date) -> pd.DataFrame:
-    try:
-        response = requests.get(
-            "https://api.openaq.org/v3/measurements",
-            params={"coordinates": f"{region.latitude},{region.longitude}", "radius": region.radius_m,
-                    "date_from": start.isoformat(), "date_to": end.isoformat(), "parameter": "pm25", "limit": 1000},
-            headers={"X-API-Key": os.getenv("OPENAQ_API_KEY")} if os.getenv("OPENAQ_API_KEY") else {},
-            timeout=20,
-        )
-        response.raise_for_status()
-        records = response.json().get("results", [])
-    except (requests.RequestException, ValueError, TypeError):
-        return pd.DataFrame()
-    return pd.DataFrame([{
-        "city": region.name,
-        "timestamp": item.get("datetime", {}).get("utc"),
-        "pm25": item.get("value"),
-        "latitude": (item.get("coordinates") or {}).get("latitude", region.latitude),
-        "longitude": (item.get("coordinates") or {}).get("longitude", region.longitude),
-    } for item in records])
+    return fetch_openaq_measurements(
+        region,
+        start,
+        end,
+        api_key=os.getenv("OPENAQ_API_KEY"),
+    )
 
 
 def _earth_engine(region: CityRegion, start: date, end: date) -> pd.DataFrame:
@@ -140,16 +127,18 @@ def _earth_engine(region: CityRegion, start: date, end: date) -> pd.DataFrame:
         collections = {
             "AOD_047": ("MODIS/061/MCD19A2_GRANULES", "Optical_Depth_047"),
             "NO2_density": ("COPERNICUS/S5P/OFFL/L3_NO2", "tropospheric_NO2_column_number_density"),
-            "temperature": ("ECMWF/ERA5_LAND/HOURLY", "temperature_2m"),
-            "wind_speed": ("ECMWF/ERA5_LAND/HOURLY", "u_component_of_wind_10m"),
+            "temperature_kelvin": ("ECMWF/ERA5_LAND/HOURLY", "temperature_2m"),
+            "dewpoint_kelvin": ("ECMWF/ERA5_LAND/HOURLY", "dewpoint_temperature_2m"),
+            "wind_u_mps": ("ECMWF/ERA5_LAND/HOURLY", "u_component_of_wind_10m"),
+            "wind_v_mps": ("ECMWF/ERA5_LAND/HOURLY", "v_component_of_wind_10m"),
             "pblh": ("ECMWF/ERA5/HOURLY", "boundary_layer_height"),
-            "relative_humidity": ("ECMWF/ERA5_LAND/HOURLY", "relative_humidity_2m"),
         }
         values: dict[str, float | None] = {}
         for output, (collection_id, band) in collections.items():
             image = ee.ImageCollection(collection_id).filterBounds(geometry).filterDate(start.isoformat(), end_exclusive).select(band).mean()
             values[output] = image.reduceRegion(ee.Reducer.mean(), geometry, 1000).getInfo().get(band)
-        return pd.DataFrame([{ "city": region.name, **values }])
+        normalized = normalize_earth_engine_features(values)
+        return pd.DataFrame([{"city": region.name, **normalized}])
     except Exception:
         return pd.DataFrame()
 

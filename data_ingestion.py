@@ -16,7 +16,7 @@ class CityRegion:
     name: str
     latitude: float
     longitude: float
-    radius_m: int = 50000
+    radius_m: int = 25000
 
 
 PAKISTAN_REGIONS = (
@@ -33,36 +33,73 @@ def fetch_openaq_measurements(
     api_key: str | None = None,
     timeout: int = 20,
 ) -> pd.DataFrame:
-    """Fetch PM2.5 observations; return an empty frame on unavailable telemetry."""
-    url = "https://api.openaq.org/v3/measurements"
-    params: dict[str, Any] = {
-        "coordinates": f"{region.latitude},{region.longitude}",
-        "radius": region.radius_m,
-        "date_from": start_date.isoformat(),
-        "date_to": end_date.isoformat(),
-        "parameter": "pm25",
-        "limit": 1000,
-    }
-    headers = {"X-API-Key": api_key} if api_key else {}
+    """Fetch hourly PM2.5 means from nearby OpenAQ sensors."""
+    if not api_key:
+        return pd.DataFrame()
+
+    headers = {"X-API-Key": api_key}
+    radius_m = min(max(int(region.radius_m), 1), 25000)
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=timeout)
+        response = requests.get(
+            "https://api.openaq.org/v3/locations",
+            params={
+                "coordinates": f"{region.latitude},{region.longitude}",
+                "radius": radius_m,
+                "parameters_id": 2,
+                "limit": 1000,
+            },
+            headers=headers,
+            timeout=timeout,
+        )
         response.raise_for_status()
-        records = response.json().get("results", [])
+        locations = response.json().get("results", [])
     except (requests.RequestException, ValueError, TypeError):
         return pd.DataFrame()
 
-    rows = []
-    for record in records:
-        coordinates = record.get("coordinates") or {}
-        rows.append(
-            {
-                "city": region.name,
-                "timestamp": record.get("datetime", {}).get("utc"),
-                "pm25": record.get("value"),
-                "latitude": coordinates.get("latitude", region.latitude),
-                "longitude": coordinates.get("longitude", region.longitude),
-            }
-        )
+    rows: list[dict[str, Any]] = []
+    seen_sensor_ids: set[int] = set()
+    for location in locations:
+        location_coordinates = location.get("coordinates") or {}
+        for sensor in location.get("sensors", []):
+            parameter = sensor.get("parameter") or {}
+            sensor_id = sensor.get("id")
+            if parameter.get("name", "").lower() != "pm25" or sensor_id is None:
+                continue
+            sensor_id = int(sensor_id)
+            if sensor_id in seen_sensor_ids:
+                continue
+            seen_sensor_ids.add(sensor_id)
+            try:
+                response = requests.get(
+                    f"https://api.openaq.org/v3/sensors/{sensor_id}/hours",
+                    params={
+                        "date_from": start_date.isoformat(),
+                        "date_to": end_date.isoformat(),
+                        "limit": 1000,
+                    },
+                    headers=headers,
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                measurements = response.json().get("results", [])
+            except (requests.RequestException, ValueError, TypeError):
+                continue
+
+            for measurement in measurements:
+                period = measurement.get("period") or {}
+                date_range = period.get("datetimeTo") or period.get("datetimeFrom") or {}
+                coordinates = measurement.get("coordinates") or location_coordinates
+                rows.append(
+                    {
+                        "city": region.name,
+                        "timestamp": date_range.get("utc"),
+                        "pm25": measurement.get("value"),
+                        "latitude": coordinates.get("latitude", region.latitude),
+                        "longitude": coordinates.get("longitude", region.longitude),
+                        "location_id": location.get("id"),
+                        "sensor_id": sensor_id,
+                    }
+                )
     return pd.DataFrame(rows)
 
 

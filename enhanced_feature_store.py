@@ -35,23 +35,38 @@ def add_physics_features(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_spatiotemporal_lags(frame: pd.DataFrame, target: str = "pm25") -> pd.DataFrame:
-    """Compute 24/48-hour rolling persistence per city, ordered by timestamp."""
+    """Compute prior-only 24/48-hour PM2.5 means independently per city."""
     if target not in frame:
         raise ValueError(f"Missing target column: {target}")
-    result = frame.copy()
-    result["timestamp"] = pd.to_datetime(result.get("timestamp"), errors="coerce", utc=True)
+    original_index = frame.index
+    result = frame.copy().reset_index(drop=True)
+    timestamp_values = result["timestamp"] if "timestamp" in result else pd.Series(pd.NaT, index=result.index)
+    result["timestamp"] = pd.to_datetime(timestamp_values, errors="coerce", utc=True)
     result["_target"] = pd.to_numeric(result[target], errors="coerce")
+    result["_original_position"] = np.arange(len(result))
     group_columns = ["city"] if "city" in result else []
-    result = result.sort_values(group_columns + ["timestamp"] if group_columns else ["timestamp"])
-    if result["timestamp"].notna().any():
-        grouped = result.set_index("timestamp").groupby(group_columns[0])["_target"] if group_columns else result.set_index("timestamp")["_target"]
-        for hours, name in ((24, "lag_24h"), (48, "lag_48h")):
-            rolled = grouped.rolling(f"{hours}h", min_periods=1).mean().reset_index(level=0, drop=True) if group_columns else grouped.rolling(f"{hours}h", min_periods=1).mean()
-            result[name] = rolled.reindex(result.set_index("timestamp").index).to_numpy()
-    else:
-        result["lag_24h"] = result.groupby(group_columns)["_target"].transform(lambda values: values.rolling(24, min_periods=1).mean()) if group_columns else result["_target"].rolling(24, min_periods=1).mean()
-        result["lag_48h"] = result.groupby(group_columns)["_target"].transform(lambda values: values.rolling(48, min_periods=1).mean()) if group_columns else result["_target"].rolling(48, min_periods=1).mean()
-    return result.drop(columns=["_target"]).sort_index()
+    sort_columns = group_columns + ["timestamp", "_original_position"] if group_columns else ["timestamp", "_original_position"]
+    result = result.sort_values(sort_columns, kind="mergesort", na_position="last")
+    groups = result.groupby(group_columns, sort=False, dropna=False) if group_columns else [(None, result)]
+
+    for hours, name in ((24, "lag_24h"), (48, "lag_48h")):
+        result[name] = np.nan
+        for _, group in groups:
+            timed_rows = group.loc[group["timestamp"].notna()]
+            if not timed_rows.empty:
+                history = timed_rows.set_index("timestamp")["_target"]
+                prior_mean = history.rolling(f"{hours}h", min_periods=1, closed="left").mean()
+                result.loc[timed_rows.index, name] = prior_mean.to_numpy()
+
+            untimed_rows = group.loc[group["timestamp"].isna()]
+            if not untimed_rows.empty:
+                prior_mean = untimed_rows["_target"].shift(1).rolling(hours, min_periods=1).mean()
+                result.loc[untimed_rows.index, name] = prior_mean.to_numpy()
+
+    result = result.sort_values("_original_position", kind="mergesort")
+    result = result.drop(columns=["_target", "_original_position"])
+    result.index = original_index
+    return result
 
 
 def prepare_features(frame: pd.DataFrame, feature_columns: Iterable[str] | None = None) -> pd.DataFrame:
@@ -62,7 +77,13 @@ def prepare_features(frame: pd.DataFrame, feature_columns: Iterable[str] | None 
     if missing:
         raise ValueError(f"Missing model feature columns: {sorted(missing)}")
     values = enriched[columns].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    return values.interpolate(limit_direction="both").ffill().bfill().fillna(0.0)
+    lag_columns = [column for column in ("lag_24h", "lag_48h") if column in values.columns]
+    other_columns = [column for column in values.columns if column not in lag_columns]
+    if other_columns:
+        values[other_columns] = values[other_columns].interpolate(limit_direction="both").ffill().bfill()
+    if lag_columns:
+        values[lag_columns] = values[lag_columns].fillna(0.0)
+    return values.fillna(0.0)
 
 
 __all__ = ["BASE_COLUMNS", "DERIVED_COLUMNS", "MODEL_COLUMNS", "add_physics_features", "add_spatiotemporal_lags", "prepare_features"]
