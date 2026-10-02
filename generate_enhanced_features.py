@@ -56,7 +56,7 @@ def prepare_features(
     frame: pd.DataFrame,
     feature_columns: Iterable[str] | None = None,
 ) -> pd.DataFrame:
-    """Engineer features and interpolate telemetry for model-ready input."""
+    """Engineer deterministic features without whole-frame interpolation."""
     result = add_physics_features(frame)
     columns = list(feature_columns) if feature_columns is not None else [
         "AOD_047",
@@ -70,9 +70,8 @@ def prepare_features(
     missing = set(columns).difference(result.columns)
     if missing:
         raise ValueError(f"Missing model feature columns: {sorted(missing)}")
-    return result[columns].apply(pd.to_numeric, errors="coerce").interpolate(
-        limit_direction="both"
-    ).ffill().bfill()
+    # Preserve missing values for fold-fitted imputation in the model pipeline.
+    return result[columns].apply(pd.to_numeric, errors="coerce")
 
 
 if __name__ == "__main__":

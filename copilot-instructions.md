@@ -1,7 +1,7 @@
-# PakSat Air Quality Analyzer & Clinical Triage System — Copilot Instructions
+# Zameen Environmental Health Intelligence — Copilot Instructions
 
 ## Project Context
-PakSat is an Environmental Health Intelligence (EHI) platform operating across Pakistan (Lahore, Karachi, Islamabad)[cite: 2, 5]. It fuses satellite observations (NASA MODIS AOD_047, Sentinel-5P NO2), ERA5 meteorological reanalysis, and OpenAQ ground sensors to estimate ground-level PM2.5 using LightGBM regressors[cite: 2, 5]. Out-of-sample target accuracy: R² ≈ 0.945, RMSE ≈ 9.91 µg/m³[cite: 2, 5]. Model outputs feed directly into an AI Healthcare Triage System for clinical risk escalation and emergency department surge forecasting[cite: 2, 5].
+Zameen is an Environmental Health Intelligence decision-support prototype for hospitals and government. Its current pilot covers Lahore, Karachi, and Islamabad. It can combine available ground observations with satellite and meteorological features for PM2.5 estimation. It does not currently provide a validated hospital-demand forecast or nationally representative pollution estimates. Never claim model performance until it has been measured on documented, held-out data.
 
 ---
 
@@ -28,7 +28,7 @@ When assisting with feature engineering or model logic, strictly enforce these d
    - Apply **Hygroscopic Growth Correction**: `1 / (1 - relative_humidity)` to strip water-weight particle distortion[cite: 2, 5].
 
 3. **Feature Importance Hierarchy**:
-   - Primary features: `AOD_047` (~51.8% weight), `NO2_density` (~25.4% weight), `photochemical_pm25_proxy` (~18.8% weight)[cite: 2, 5].
+   - Do not hardcode feature-importance claims; calculate and document them for each validated model artifact.
 
 ---
 
@@ -36,7 +36,7 @@ When assisting with feature engineering or model logic, strictly enforce these d
 
 ### Python & Machine Learning
 - Prefer vectorized `pandas` / `numpy` operations over loops for data processing.
-- Ensure all model training scripts maintain spatial/temporal cross-validation splits across test cities (Lahore, Karachi, Islamabad) to prevent data leakage[cite: 2, 5].
+- Ensure all model training scripts maintain spatial/temporal cross-validation splits to prevent data leakage.
 - Always handle missing satellite/meteorological data gracefully (e.g., cloud masking or iterative interpolation) before passing inputs to LightGBM.
 
 ### Streamlit & Visualization (`app.py`)
@@ -52,4 +52,4 @@ When assisting with feature engineering or model logic, strictly enforce these d
 ## What to Avoid (Anti-Patterns)
 - **NO** hardcoded GCP credentials or GEE auth keys; use environment variables or native GEE authentication.
 - **NO** linear ML models for PM2.5 prediction without non-linear interaction terms.
-- **NO** fabricated accuracy claims—keep predictions aligned with empirical data metrics ($R^2 \approx 0.9450$, $\text{RMSE} \approx 9.91\,\mu\text{g}/\text{m}^3$)[cite: 2, 5].
+- **NO** fabricated accuracy claims. The 80% exceedance-recall value is a target, not a verified result. Report the metric, screening threshold, validation split, and event count together.

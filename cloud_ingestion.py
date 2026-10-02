@@ -16,7 +16,12 @@ from typing import Any, Mapping
 
 import pandas as pd
 
-from data_ingestion import CityRegion, PAKISTAN_REGIONS, fetch_openaq_measurements
+from data_ingestion import (
+    CityRegion,
+    PAKISTAN_REGIONS,
+    fetch_openaq_measurements,
+    merge_prior_covariates,
+)
 from paksat.telemetry_normalization import normalize_earth_engine_features
 
 
@@ -144,17 +149,19 @@ def _earth_engine(region: CityRegion, start: date, end: date) -> pd.DataFrame:
 
 
 def load_integrated_telemetry(region: CityRegion, days: int = 2, cache: OSSCache | None = None) -> pd.DataFrame:
-    """Load ground, satellite, and meteorological signals with interpolation."""
+    """Load ground data and only temporally safe satellite/weather covariates."""
     end = date.today()
     start = end - timedelta(days=max(days, 1))
     ground = _openaq(region, start, end)
     satellite = _earth_engine(region, start, end)
     if not satellite.empty:
-        ground = ground.merge(satellite, on="city", how="left") if not ground.empty else satellite
+        ground = merge_prior_covariates(ground, satellite)
+        # Untimestamped regional averages cannot be safely joined to historical
+        # ground rows without introducing look-ahead bias.
     if ground.empty:
         return ground
-    numeric = ground.select_dtypes(include="number").columns
-    ground[numeric] = ground[numeric].interpolate(limit_direction="both").ffill().bfill()
+    # Do not interpolate sensor targets or covariates across observation times;
+    # model-side imputers are fitted on training folds only.
     if cache and cache.available:
         cache.put(f"telemetry/{region.name.lower()}-{end.isoformat()}.csv", ground.to_csv(index=False).encode())
     return ground

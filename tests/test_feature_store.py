@@ -42,9 +42,9 @@ class FeatureStoreTests(unittest.TestCase):
                     }
                 )
         features = prepare_features(pd.DataFrame(rows))
-        self.assertEqual(features.loc[0, "lag_24h"], 0.0)
+        self.assertTrue(pd.isna(features.loc[0, "lag_24h"]))
         self.assertEqual(features.loc[1, "lag_24h"], 10.0)
-        self.assertEqual(features.loc[2, "lag_24h"], 0.0)
+        self.assertTrue(pd.isna(features.loc[2, "lag_24h"]))
         self.assertEqual(features.loc[3, "lag_24h"], 100.0)
 
 

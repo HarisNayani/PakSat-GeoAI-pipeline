@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from math import isfinite
 from typing import Any
 
+import numpy as np
+
 RESOURCE_TYPES = ("emergency_beds", "oxygen_cylinders", "nebulizer_stations")
 RESOURCE_RISK_WEIGHTS = {
     "emergency_beds": 1.0,
@@ -23,8 +25,8 @@ def optimize_hospital_resources(
     ``predicted_surge_data`` maps each hospital to resource demand counts and
     an optional positive ``risk_weight``. Demand may also be nested under
     ``resource_demand``. Supplies are system-wide totals keyed by resource.
-    Returned counts can be fractional; round operational allocations only
-    after applying local clinical and logistics rules.
+    Resource demands and supplies are integer counts and allocations are exact
+    non-negative integers. This model does not replace local clinical rules.
     """
     if not predicted_surge_data:
         raise ValueError("At least one hospital demand record is required.")
@@ -44,14 +46,18 @@ def optimize_hospital_resources(
             amount = float(raw_demand.get(resource, 0.0))
             if not isfinite(amount) or amount < 0:
                 raise ValueError(f"Demand for {resource} at {hospital} must be non-negative.")
+            if not amount.is_integer():
+                raise ValueError(f"Demand for {resource} at {hospital} must be an integer count.")
             demands[hospital][resource] = amount
 
     supplies = {resource: float(available_supplies.get(resource, 0.0)) for resource in RESOURCE_TYPES}
     if any(not isfinite(amount) or amount < 0 for amount in supplies.values()):
         raise ValueError("Available supplies must be finite and non-negative.")
+    if any(not amount.is_integer() for amount in supplies.values()):
+        raise ValueError("Available supplies must be integer counts.")
 
     try:
-        from scipy.optimize import linprog
+        from scipy.optimize import Bounds, LinearConstraint, milp
     except ImportError as error:
         raise RuntimeError("Install the `scipy` dependency to optimize hospital allocations.") from error
 
@@ -66,22 +72,30 @@ def optimize_hospital_resources(
             [1.0 if variable_resource == resource else 0.0 for _, variable_resource in variables]
         )
 
-    result = linprog(
-        c=objective,
-        A_ub=supply_constraints,
-        b_ub=[supplies[resource] for resource in RESOURCE_TYPES],
-        bounds=[(0.0, demands[hospital][resource]) for hospital, resource in variables],
-        method="highs",
+    demand_bounds = np.asarray(
+        [demands[hospital][resource] for hospital, resource in variables], dtype=float
     )
-    if not result.success:
+    # Every allocation decision is integral; supply rows impose one cap per resource.
+    result = milp(
+        c=np.asarray(objective, dtype=float),
+        integrality=np.ones(len(variables), dtype=int),
+        bounds=Bounds(np.zeros(len(variables)), demand_bounds),
+        constraints=LinearConstraint(
+            np.asarray(supply_constraints, dtype=float),
+            -np.inf,
+            np.asarray([supplies[resource] for resource in RESOURCE_TYPES], dtype=float),
+        ),
+        options={"mip_rel_gap": 0.0},
+    )
+    if not result.success or result.x is None:
         raise RuntimeError(f"Hospital resource optimization failed: {result.message}")
 
     allocation = {hospital: {} for hospital in hospitals}
     unmet_demand = {hospital: {} for hospital in hospitals}
     risk_score = 0.0
     for (hospital, resource), amount in zip(variables, result.x):
-        allocated = float(amount)
-        unmet = max(0.0, demands[hospital][resource] - allocated)
+        allocated = int(round(float(amount)))
+        unmet = int(demands[hospital][resource] - allocated)
         allocation[hospital][resource] = allocated
         unmet_demand[hospital][resource] = unmet
         risk_score += unmet * risk_weights[hospital] * RESOURCE_RISK_WEIGHTS[resource]

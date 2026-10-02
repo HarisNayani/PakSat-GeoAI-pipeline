@@ -58,10 +58,7 @@ def add_spatiotemporal_lags(frame: pd.DataFrame, target: str = "pm25") -> pd.Dat
                 prior_mean = history.rolling(f"{hours}h", min_periods=1, closed="left").mean()
                 result.loc[timed_rows.index, name] = prior_mean.to_numpy()
 
-            untimed_rows = group.loc[group["timestamp"].isna()]
-            if not untimed_rows.empty:
-                prior_mean = untimed_rows["_target"].shift(1).rolling(hours, min_periods=1).mean()
-                result.loc[untimed_rows.index, name] = prior_mean.to_numpy()
+            # Untimestamped rows have no defensible ordering; leave their lags missing.
 
     result = result.sort_values("_original_position", kind="mergesort")
     result = result.drop(columns=["_target", "_original_position"])
@@ -70,20 +67,16 @@ def add_spatiotemporal_lags(frame: pd.DataFrame, target: str = "pm25") -> pd.Dat
 
 
 def prepare_features(frame: pd.DataFrame, feature_columns: Iterable[str] | None = None) -> pd.DataFrame:
-    """Return model-ready numeric features with linear interpolation and fallback fill."""
+    """Return deterministic features without fitting or applying imputation."""
     enriched = add_spatiotemporal_lags(add_physics_features(frame)) if "pm25" in frame else add_physics_features(frame)
     columns = list(feature_columns or MODEL_COLUMNS)
     missing = set(columns).difference(enriched.columns)
     if missing:
         raise ValueError(f"Missing model feature columns: {sorted(missing)}")
     values = enriched[columns].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    lag_columns = [column for column in ("lag_24h", "lag_48h") if column in values.columns]
-    other_columns = [column for column in values.columns if column not in lag_columns]
-    if other_columns:
-        values[other_columns] = values[other_columns].interpolate(limit_direction="both").ffill().bfill()
-    if lag_columns:
-        values[lag_columns] = values[lag_columns].fillna(0.0)
-    return values.fillna(0.0)
+    # Keep missing telemetry as NaN. Learned imputation belongs inside the
+    # fold-fitted estimator pipeline, never in this whole-frame helper.
+    return values
 
 
 __all__ = ["BASE_COLUMNS", "DERIVED_COLUMNS", "MODEL_COLUMNS", "add_physics_features", "add_spatiotemporal_lags", "prepare_features"]

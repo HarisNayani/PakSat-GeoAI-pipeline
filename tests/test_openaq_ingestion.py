@@ -2,10 +2,31 @@ import unittest
 from datetime import date
 from unittest.mock import Mock, patch
 
-from data_ingestion import CityRegion, fetch_openaq_measurements
+import pandas as pd
+
+from data_ingestion import CityRegion, fetch_openaq_measurements, merge_prior_covariates
 
 
 class OpenAQIngestionTests(unittest.TestCase):
+    def test_covariate_join_is_backward_only_and_requires_timestamps(self):
+        ground = pd.DataFrame(
+            [
+                {"city": "Lahore", "timestamp": "2026-09-01T12:00:00Z", "pm25": 20.0},
+                {"city": "Lahore", "timestamp": "2026-09-01T14:00:00Z", "pm25": 25.0},
+            ]
+        )
+        satellite = pd.DataFrame(
+            [{"city": "Lahore", "timestamp": "2026-09-01T13:00:00Z", "AOD_047": 0.7}]
+        )
+        joined = merge_prior_covariates(ground, satellite)
+        self.assertTrue(pd.isna(joined.loc[0, "AOD_047"]))
+        self.assertEqual(joined.loc[1, "AOD_047"], 0.7)
+
+        untimed = merge_prior_covariates(
+            ground, pd.DataFrame([{"city": "Lahore", "AOD_047": 0.9}])
+        )
+        self.assertNotIn("AOD_047", untimed.columns)
+
     def test_requires_api_key(self):
         with patch("data_ingestion.requests.get") as get:
             result = fetch_openaq_measurements(

@@ -103,6 +103,49 @@ def fetch_openaq_measurements(
     return pd.DataFrame(rows)
 
 
+def merge_prior_covariates(
+    ground: pd.DataFrame,
+    covariates: pd.DataFrame,
+    *,
+    tolerance: str = "6h",
+) -> pd.DataFrame:
+    """Attach only timestamped covariates observed at or before each target row."""
+    required = {"city", "timestamp"}
+    if ground.empty or covariates.empty or not required.issubset(ground.columns) or not required.issubset(covariates.columns):
+        return ground.copy()
+
+    result = ground.copy().reset_index(drop=True)
+    result["_row_position"] = range(len(result))
+    result["_match_time"] = pd.to_datetime(result["timestamp"], errors="coerce", utc=True)
+    right = covariates.copy()
+    right["_match_time"] = pd.to_datetime(right["timestamp"], errors="coerce", utc=True)
+    payload_names = {
+        column: f"{column}_covariate" if column in ground.columns else column
+        for column in right.columns
+        if column not in required and column != "_match_time"
+    }
+    payload_columns = list(payload_names.values()) + ["covariate_timestamp"]
+    right = right.rename(columns={"timestamp": "covariate_timestamp", **payload_names})
+    left_timed = result.loc[result["_match_time"].notna(), ["_row_position", "city", "_match_time"]]
+    right_timed = right.loc[right["_match_time"].notna(), ["city", "_match_time", *payload_columns]]
+    for column in payload_columns:
+        result[column] = pd.Series([None] * len(result), dtype="object")
+    if left_timed.empty or right_timed.empty:
+        return result.drop(columns=["_row_position", "_match_time"])
+
+    matched = pd.merge_asof(
+        left_timed.sort_values("_match_time"),
+        right_timed.sort_values("_match_time"),
+        on="_match_time",
+        by="city",
+        direction="backward",
+        tolerance=pd.Timedelta(tolerance),
+    )
+    for column in payload_columns:
+        result.loc[matched["_row_position"].to_numpy(), column] = matched[column].to_numpy()
+    return result.drop(columns=["_row_position", "_match_time"])
+
+
 def initialize_earth_engine() -> Any:
     """Initialize Earth Engine using native auth and an optional project variable."""
     try:
@@ -160,5 +203,5 @@ def load_sensor_data(
     if include_satellite:
         satellite = fetch_satellite_telemetry(region, start_date, end_date)
         if not satellite.empty:
-            ground = ground.merge(satellite, on="city", how="left")
+            ground = merge_prior_covariates(ground, satellite)
     return ground
