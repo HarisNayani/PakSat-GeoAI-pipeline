@@ -6,6 +6,7 @@ import logging
 import os
 import pickle
 from hashlib import sha256
+from datetime import date
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,19 +15,37 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from branca.element import Element
-from folium.plugins import HeatMap
+from dotenv import load_dotenv
 from streamlit_folium import st_folium
 
 from cloud_ingestion import PAKISTAN_REGIONS, load_integrated_telemetry
-from clinical_api_engine import assess_patient_risk, predict_hospital_capacity
-from paksat.causal_policy import PANEL_COLUMNS, CausalPolicySimulator, simulate_policy_impact
+from clinical_api_engine import assess_patient_risk
+from paksat.causal_policy import (
+    PANEL_ALIGNMENT_COLUMNS,
+    PANEL_COLUMNS,
+    CausalPolicySimulator,
+    simulate_policy_impact,
+)
 from paksat.economic_impact import EconomicAssumptions, estimate_health_economic_benefit
-from paksat.geospatial import PM25_THRESHOLD_PROFILES, build_pm25_deck
+from paksat.air_quality import (
+    MIN_24H_HOURLY_COVERAGE,
+    filter_observation_period,
+    prepare_observation_upload,
+    summarize_city_pm25,
+)
+from paksat.geospatial import (
+    PAKISTAN_BOUNDS,
+    PM25_THRESHOLD_PROFILES,
+    build_pm25_deck,
+    prepare_pm25_map_data,
+)
 from paksat.resource_optimizer import RESOURCE_TYPES, optimize_hospital_resources
+from pipeline import PM25_EXCEEDANCE_RECALL_TARGET
 from train_pai_model import predict_with_uncertainty
 
 MODEL_PATH = Path(__file__).with_name("lightgbm_pm25_model.pkl")
 LOGGER = logging.getLogger(__name__)
+load_dotenv(Path(__file__).with_name(".env"), override=False)
 
 
 @st.cache_resource
@@ -133,6 +152,12 @@ def load_live_regional_telemetry() -> tuple[pd.DataFrame, list[str]]:
     return pd.concat(frames, ignore_index=True, sort=False), unavailable
 
 
+@st.cache_data(ttl=300, max_entries=4, show_spinner=False)
+def cached_pm25_map_data(data: pd.DataFrame) -> pd.DataFrame:
+    """Cache bounded spatial bins, not a large raw sensor payload."""
+    return prepare_pm25_map_data(data)
+
+
 def make_map(data: pd.DataFrame, latitude: float, longitude: float) -> folium.Map:
     # OpenStreetMap is public and does not require a tile API key.
     air_map = folium.Map(location=[latitude, longitude], zoom_start=5, tiles="OpenStreetMap", control_scale=True)
@@ -141,9 +166,12 @@ def make_map(data: pd.DataFrame, latitude: float, longitude: float) -> folium.Ma
         if column in map_data.columns:
             map_data[column] = pd.to_numeric(map_data[column], errors="coerce")
     map_data = map_data.dropna(subset=["latitude", "longitude", "pm25"])
-    heat_points = map_data[["latitude", "longitude", "pm25"]].values.tolist()
-    if heat_points:
-        HeatMap(heat_points, radius=28, blur=20, min_opacity=0.35).add_to(air_map)
+    map_data = map_data.loc[
+        map_data["latitude"].between(*PAKISTAN_BOUNDS["latitude"])
+        & map_data["longitude"].between(*PAKISTAN_BOUNDS["longitude"])
+    ]
+    if len(map_data) > 1000:
+        map_data = map_data.sample(n=1000, random_state=42)
     for raw_row in map_data.to_dict(orient="records"):
         row = cast(dict[str, Any], raw_row)
         row_pm25 = float(row["pm25"])
@@ -160,16 +188,24 @@ def make_map(data: pd.DataFrame, latitude: float, longitude: float) -> folium.Ma
         '<span style="color:#f08c00">&#9679;</span> 55-150 '
         '<span style="color:#d62828">&#9679;</span> &gt; 150</div>'
     ))
-    folium.Marker([latitude, longitude], tooltip="Selected location", icon=folium.Icon(color="blue")).add_to(air_map)
+    folium.CircleMarker(
+        [latitude, longitude],
+        radius=5,
+        color="#1769aa",
+        fill=True,
+        fill_color="#1769aa",
+        fill_opacity=1.0,
+        tooltip="Selected location",
+    ).add_to(air_map)
     return air_map
 
 
 def main() -> None:
-    st.set_page_config(page_title="PakSat EHI", page_icon="P", layout="wide")
-    st.title("PakSat | Public Health & Economic Intelligence")
+    st.set_page_config(page_title="Zameen | Environmental Health Intelligence", page_icon="Z", layout="wide")
+    st.title("Zameen | Environmental Health Intelligence")
     st.caption(
-        "A three-city government decision-support pilot connecting air-pollution "
-        "evidence, clinical pressure, and transparent intervention economics. "
+        "Decision support for hospitals and government: connect air-pollution "
+        "evidence, clinical preparedness, and transparent intervention scenarios. "
         "Not an official AQI bulletin or a national burden estimate."
     )
 
@@ -181,42 +217,112 @@ def main() -> None:
         age = st.number_input("Patient age", min_value=0, max_value=120, value=35)
         asthma = st.checkbox("Asthma history")
         copd = st.checkbox("COPD history")
-        selected_city = st.selectbox("Sensor region", [region.name for region in PAKISTAN_REGIONS])
-        use_live = st.checkbox("Use live OpenAQ telemetry", value=False)
+        historical_file = st.file_uploader(
+            "Upload historical observations (CSV)",
+            type=["csv"],
+            help="Required columns: city, timestamp, pm25. Optional: latitude, longitude, sensor_id, weather and satellite features. Valid uploads replace demo/live rows.",
+            key="historical_observations",
+        )
+        st.download_button(
+            "Download observation CSV template",
+            data=pd.DataFrame(
+                columns=["city", "timestamp", "pm25", "latitude", "longitude", "sensor_id"]
+            ).to_csv(index=False),
+            file_name="zameen_observations_template.csv",
+            mime="text/csv",
+        )
+        uploaded_observations: pd.DataFrame | None = None
+        excluded_upload_rows = 0
+        if historical_file is not None:
+            try:
+                uploaded_observations, excluded_upload_rows = prepare_observation_upload(
+                    pd.read_csv(historical_file)
+                )
+                if excluded_upload_rows:
+                    st.warning(f"Excluded {excluded_upload_rows:,} invalid upload rows.")
+            except (ValueError, pd.errors.ParserError, UnicodeError) as error:
+                st.error(f"Historical upload could not be used: {error}")
+        city_options = [region.name for region in PAKISTAN_REGIONS]
+        if uploaded_observations is not None:
+            city_options = list(dict.fromkeys([
+                *city_options,
+                *uploaded_observations["city"].astype(str).unique().tolist(),
+            ]))
+        selected_city = st.selectbox("Sensor region", city_options)
+        use_live = st.checkbox(
+            "Use live OpenAQ telemetry",
+            value=False,
+            disabled=uploaded_observations is not None,
+        )
 
     artifact = load_model(str(MODEL_PATH))
     live_unavailable: list[str] = []
     model_uncertainty_available = False
-    if use_live:
-        if not os.getenv("OPENAQ_API_KEY"):
-            st.warning("Set OPENAQ_API_KEY to fetch live ground PM2.5 from OpenAQ; without it the dashboard uses clearly labelled synthetic demo data.")
-        with st.spinner("Loading available regional telemetry..."):
-            data, live_unavailable = load_live_regional_telemetry()
+    live_status_message: str | None = None
+    has_openaq_key = bool(os.getenv("OPENAQ_API_KEY"))
+    if uploaded_observations is not None:
+        data = uploaded_observations.copy()
+    elif use_live:
+        if has_openaq_key:
+            with st.spinner("Loading available regional telemetry..."):
+                data, live_unavailable = load_live_regional_telemetry()
+        else:
+            data = pd.DataFrame()
+            live_status_message = (
+                "Live OpenAQ credentials are not configured. This demo remains fully "
+                "usable with clearly labeled synthetic observations."
+            )
         if "pm25" in data.columns:
-            data["pm25"] = pd.to_numeric(data["pm25"], errors="coerce")
+            data["pm25"] = pd.to_numeric(data["pm25"], errors="coerce").replace(
+                [np.inf, -np.inf], np.nan
+            )
             data = data.dropna(subset=["pm25"])
+            data = data.loc[data["pm25"] >= 0]
         if not data.empty and "city" in data.columns and not data["city"].astype(str).eq(selected_city).any():
             selected_demo = demo_data().loc[lambda rows: rows["city"].eq(selected_city)].copy()
             selected_demo["record_source"] = "Synthetic demo fallback"
-            data = pd.concat([data, selected_demo], ignore_index=True, sort=False)
-            st.warning(
-                f"No live PM2.5 rows are available for {selected_city}; its displayed "
-                "record is synthetic. Other available regional rows remain live."
+            data = pd.concat([data, selected_demo], sort=False).reset_index(drop=True)
+            live_status_message = (
+                f"{selected_city} has no live observations; its panel uses labeled demo "
+                "data. Other available regions remain live."
             )
     else:
         data = pd.DataFrame()
 
-    if data.empty or "pm25" not in data.columns or not data["pm25"].notna().any():
+    if (
+        data.empty
+        or "pm25" not in data.columns
+        or not pd.to_numeric(data["pm25"], errors="coerce").ge(0).any()
+    ):
         data = demo_data()
         data["record_source"] = "Synthetic demo"
-        st.info("Showing illustrative demo observations. Enable live telemetry for regional sensor data.")
+        if use_live and has_openaq_key:
+            unavailable_text = ", ".join(live_unavailable) if live_unavailable else "all regions"
+            live_status_message = (
+                f"Live telemetry is currently unavailable for {unavailable_text}. "
+                "Showing clearly labeled synthetic demo observations instead."
+            )
+        elif not use_live:
+            live_status_message = "Demo mode: showing clearly labeled synthetic observations."
     elif "record_source" not in data.columns:
         data["record_source"] = "Live telemetry"
 
-    if use_live and live_unavailable:
-        st.warning(f"Live data is unavailable for: {', '.join(live_unavailable)}. Those regions are not represented as measured data.")
+    if uploaded_observations is not None:
+        st.success(
+            f"Historical upload active: {len(data):,} valid observations. "
+            "Uploaded data is kept separate from demo and live telemetry."
+        )
+    if live_status_message:
+        if use_live and uploaded_observations is None:
+            st.warning(live_status_message)
+        else:
+            st.info(live_status_message)
 
-    data["pm25"] = pd.to_numeric(data["pm25"], errors="coerce")
+    data["pm25"] = pd.to_numeric(data["pm25"], errors="coerce").replace(
+        [np.inf, -np.inf], np.nan
+    )
+    data = data.dropna(subset=["pm25"])
+    data = data.loc[data["pm25"] >= 0]
     if artifact:
         try:
             predictions = predict_with_uncertainty(artifact, data)
@@ -234,14 +340,51 @@ def main() -> None:
         data["pm25_lower"] = data["pm25"]
         data["pm25_upper"] = data["pm25"]
 
+    if "timestamp" in data.columns:
+        available_timestamps = pd.to_datetime(
+            data["timestamp"], format="mixed", errors="coerce", utc=True
+        )
+        available_dates = available_timestamps.dropna().dt.date
+        if not available_dates.empty:
+            earliest_date, latest_date = available_dates.min(), available_dates.max()
+            selected_period = st.date_input(
+                "Evidence date range (UTC)",
+                value=(earliest_date, latest_date),
+                min_value=earliest_date,
+                max_value=latest_date,
+                help="The evidence table, percentile summary and trend use this inclusive date range.",
+                key="evidence_date_range",
+            )
+            if isinstance(selected_period, date):
+                start_date = end_date = selected_period
+            elif isinstance(selected_period, (tuple, list)) and len(selected_period) == 2:
+                start_date = cast(date, selected_period[0])
+                end_date = cast(date, selected_period[1])
+            else:
+                st.error("Choose a valid start and end date.")
+                st.stop()
+            data = filter_observation_period(data, start_date, end_date)
+            if data.empty:
+                st.warning("No observations fall inside this date range. Expand the range to continue.")
+                st.stop()
+            st.caption(
+                f"Evidence window: {start_date.isoformat()} to {end_date.isoformat()} UTC "
+                f"({len(data):,} observations)."
+            )
+        else:
+            st.info("No valid timestamps are available for a historical trend. Upload rows with city, timestamp and PM2.5.")
+    else:
+        st.info("Historical trends require timestamped observations. Upload a CSV to choose an evidence date range.")
+
     selected_observations = data.loc[data["city"].astype(str).eq(selected_city)]
     if selected_observations.empty:
         selected_observations = data
-    current = float(selected_observations["pm25"].median())
-    upper = float(selected_observations["pm25_upper"].median())
+        st.info(f"No {selected_city} observations fall in this period; showing {selected_observations.iloc[0]['city']} instead.")
+        selected_city = str(selected_observations.iloc[0]["city"])
+    exposure = summarize_city_pm25(data, selected_city)
+    current = exposure.latest_pm25
+    upper = exposure.latest_upper
     risk = assess_patient_risk(current, upper, symptoms, {"age": age, "asthma": asthma, "copd": copd})
-    surge = predict_hospital_capacity(current / 2.0, current / 100.0)
-
     st.subheader("Government evidence brief")
     summary = (
         data.groupby("city", as_index=False)
@@ -256,12 +399,34 @@ def main() -> None:
     evidence_cols = st.columns(4)
     evidence_cols[0].metric("Regions represented", str(data["city"].nunique()))
     evidence_cols[1].metric("PM2.5 records", f"{int(data['pm25'].count()):,}")
-    evidence_cols[2].metric(f"{selected_city} median PM2.5", f"{current:.1f} µg/m³")
+    reading_label = "Latest" if exposure.latest_timestamp is not None else "Window median"
+    evidence_cols[2].metric(
+        f"{selected_city} {reading_label} PM2.5",
+        f"{current:.1f} µg/m³",
+    )
     if model_uncertainty_available:
-        lower = float(selected_observations["pm25_lower"].median())
-        evidence_cols[3].metric("Model q05-q95 band", f"{lower:.1f} to {upper:.1f} µg/m³")
+        evidence_cols[3].metric(
+            "Latest model q05-q95 band",
+            f"{exposure.latest_lower:.1f} to {upper:.1f} µg/m³",
+        )
     else:
-        evidence_cols[3].metric("Predictive interval", "Unavailable")
+        average_text = (
+            f"{exposure.trailing_24h_mean:.1f} µg/m³"
+            if exposure.trailing_24h_mean is not None
+            else f"Insufficient ({exposure.trailing_24h_hour_count}/{MIN_24H_HOURLY_COVERAGE} hours)"
+        )
+        evidence_cols[3].metric("Trailing 24-hour mean", average_text)
+    if exposure.latest_timestamp is not None:
+        sensor_text = (
+            f" across {exposure.latest_sensor_count} sensors"
+            if exposure.latest_sensor_count is not None
+            else ""
+        )
+        st.caption(
+            f"Latest {selected_city} sample: {exposure.latest_timestamp.isoformat()}"
+            f"{sensor_text}. The 24-hour mean uses hourly medians and is shown only "
+            f"with at least {MIN_24H_HOURLY_COVERAGE} distinct hourly readings."
+        )
     with st.expander("Regional evidence ledger", expanded=True):
         st.dataframe(summary, hide_index=True)
         st.download_button(
@@ -283,28 +448,55 @@ def main() -> None:
                 ).sort_index()
                 st.line_chart(trend_table)
             else:
-                st.info("A time trend needs multiple valid timestamps; no trend is inferred from a single snapshot.")
+                st.info("This evidence window has fewer than two distinct timestamps, so a trend cannot be plotted.")
         st.caption(
-            "P95 is descriptive of the rows currently loaded. Demo rows are synthetic; "
-            "sensor-level observations are not regulatory 24-hour averages."
+            "P95 and the trend use valid rows inside the selected date range. "
+            "Uploaded and synthetic demo observations are not regulatory 24-hour averages."
         )
     st.caption(
         "The current pilot covers Lahore, Karachi, and Islamabad. Economic values below "
         "are per panel observation and require locally sourced assumptions; no national "
         "annual total is inferred from this sample."
     )
+    with st.expander("Model validation and 80% target"):
+        variant = artifact.get("model_variant") if artifact else None
+        validation_metrics = (artifact or {}).get("metrics", {}).get(variant, {})
+        if validation_metrics:
+            recall = validation_metrics.get("pm25_exceedance_recall", float("nan"))
+            threshold = validation_metrics.get("pm25_exceedance_threshold_ug_m3")
+            if threshold is not None and np.isfinite(recall):
+                status = "Target met" if recall >= PM25_EXCEEDANCE_RECALL_TARGET else "Below target"
+                st.metric(
+                    "Held-out exceedance recall",
+                    f"{recall:.0%}",
+                    delta=status,
+                    help="Recall of held-out rows whose observed PM2.5 meets or exceeds the configured screening cutoff.",
+                )
+                st.caption(
+                    f"Goal: at least {PM25_EXCEEDANCE_RECALL_TARGET:.0%}. "
+                    f"Cutoff: {threshold:g} µg/m³. Validation rows: "
+                    f"{int(validation_metrics.get('rows', 0)):,}. "
+                    "This is row-level exceedance recall, not generic accuracy or a validated forecast. "
+                    "Confirm the cutoff and averaging period with local authorities."
+                )
+            else:
+                st.info("The validation set had no exceedance events, so recall cannot be calculated.")
+            if "rmse_ug_m3" in validation_metrics:
+                st.caption(f"Held-out PM2.5 RMSE: {validation_metrics['rmse_ug_m3']:.1f} µg/m³.")
+        else:
+            st.info("No saved model validation metrics are available. Train on validated, timestamped observations to assess the 80% target.")
 
     monitoring_tab, map_tab, policy_tab, resources_tab = st.tabs(
         ["Monitoring & triage", "3D geospatial", "Policy simulator", "Resource allocation"]
     )
 
     with monitoring_tab:
-        st.subheader(f"{selected_city} nowcast")
+        st.subheader(f"{selected_city} monitoring")
         metric_cols = st.columns(4)
-        metric_cols[0].metric("Current PM2.5", f"{current:.1f} μg/m³")
+        metric_cols[0].metric(f"{reading_label} PM2.5", f"{current:.1f} μg/m³")
         metric_cols[1].metric("Upper bound", f"{upper:.1f} μg/m³")
         metric_cols[2].metric("Risk level", risk["severity"])
-        metric_cols[3].metric("24-48h capacity", f"{surge['estimated_surge_percent']:.1f}%")
+        metric_cols[3].metric("Hospital forecast", "Not connected")
 
         col_map, col_triage = st.columns([1.4, 1])
         with col_map:
@@ -328,11 +520,8 @@ def main() -> None:
                 st.warning(risk["severity"])
             for recommendation in risk["advice"]:
                 st.write(f"- {recommendation}")
-            st.subheader("Emergency capacity")
-            if surge["capacity_warning"]:
-                st.warning(surge["message"])
-            else:
-                st.success(surge["message"])
+            st.subheader("Capacity planning")
+            st.info("No validated 24-48h hospital-demand forecast is connected.")
             st.caption(risk["disclaimer"])
 
     with map_tab:
@@ -344,7 +533,8 @@ def main() -> None:
             "bands. Confirm EPA breakpoint adoption locally before operational use."
         )
         try:
-            st.pydeck_chart(build_pm25_deck(data, thresholds=thresholds))
+            map_data = cached_pm25_map_data(data)
+            st.pydeck_chart(build_pm25_deck(map_data, thresholds=thresholds, aggregated=True))
             if not ({"wind_u_mps", "wind_v_mps"}.issubset(data.columns) or "wind_direction_degrees" in data.columns):
                 st.info("Wind vectors are not available in these observations; the flow overlay appears when wind direction or u/v components are ingested.")
         except (RuntimeError, ValueError) as error:
@@ -353,7 +543,7 @@ def main() -> None:
 
     with policy_tab:
         st.subheader("Causal policy intervention simulator")
-        st.warning("Observational estimates are not forecasts. Validate identification assumptions and local policy data before using results for decisions.")
+        st.warning("Observational counterfactual scenarios are not forecasts or identified causal effects. Validate assumptions and local policy data before decision use.")
         policy_file = st.file_uploader(
             "Upload aligned policy and outcome panel (CSV)",
             type=["csv"],
@@ -362,7 +552,9 @@ def main() -> None:
         )
         st.download_button(
             "Download policy-panel CSV template",
-            data=pd.DataFrame(columns=sorted(PANEL_COLUMNS)).to_csv(index=False),
+            data=pd.DataFrame(
+                columns=[*PANEL_ALIGNMENT_COLUMNS, *sorted(PANEL_COLUMNS)]
+            ).to_csv(index=False),
             file_name="paksat_policy_panel_template.csv",
             mime="text/csv",
         )
@@ -397,9 +589,11 @@ def main() -> None:
                 ):
                     estimate = saved_estimate["estimate"]
                     result_cols = st.columns(2)
-                    result_cols[0].metric("Estimated PM2.5 reduction", f"{estimate['estimated_pm25_reduction_ug_m3']:.2f} µg/m³")
-                    result_cols[1].metric("Projected admissions reduction per panel observation", f"{estimate['projected_admissions_reduction']:.2f}")
+                    result_cols[0].metric("Scenario PM2.5 change", f"{estimate['estimated_pm25_change_ug_m3']:+.2f} µg/m³")
+                    result_cols[1].metric("Scenario admissions change per observation", f"{estimate['estimated_admissions_change']:+.2f}")
                     st.caption(estimate["interpretation"])
+                    if estimate.get("diagnostics"):
+                        st.warning("Model diagnostic: " + " ".join(estimate["diagnostics"]))
                     with st.expander("Translate to an auditable PKR scenario"):
                         medical_cost = st.number_input("Direct medical cost per admission (PKR)", min_value=0.0, value=0.0, step=1000.0)
                         workdays_lost = st.number_input("Workdays lost per admission", min_value=0.0, value=0.0, step=0.5)
@@ -442,12 +636,17 @@ def main() -> None:
             "JPMC Karachi": (10, 16, 7),
             "PIMS Islamabad": (8, 12, 6),
         }
-        predicted_surge_data: dict[str, dict[str, float]] = {}
+        scenario_demand_data: dict[str, dict[str, float]] = {}
         hospital_columns = st.columns(len(hospital_defaults))
         for (hospital, defaults), column in zip(hospital_defaults.items(), hospital_columns):
             with column:
                 st.markdown(f"**{hospital}**")
-                predicted_surge_data[hospital] = {
+                scenario_demand_data[hospital] = {
+                    "risk_weight": float(st.number_input(
+                        "Priority weight", min_value=0.1, max_value=5.0, value=1.0,
+                        step=0.1, key=f"priority_{hospital}",
+                        help="Relative planning priority only; agree weights with hospital operations and clinical leadership.",
+                    )),
                     "emergency_beds": float(st.number_input("Bed demand", min_value=0, value=defaults[0], key=f"beds_{hospital}")),
                     "oxygen_cylinders": float(st.number_input("Oxygen cylinders", min_value=0, value=defaults[1], key=f"oxygen_{hospital}")),
                     "nebulizer_stations": float(st.number_input("Nebulizer stations", min_value=0, value=defaults[2], key=f"nebulizers_{hospital}")),
@@ -466,8 +665,14 @@ def main() -> None:
         }
         if st.button("Optimize allocation", key="optimize_resources"):
             try:
-                allocation = optimize_hospital_resources(predicted_surge_data, available_supplies)
-                st.dataframe(pd.DataFrame(allocation["allocation"]).T)
+                allocation = optimize_hospital_resources(scenario_demand_data, available_supplies)
+                result_columns = st.columns(2)
+                with result_columns[0]:
+                    st.markdown("**Allocated resources**")
+                    st.dataframe(pd.DataFrame(allocation["allocation"]).T, width="stretch")
+                with result_columns[1]:
+                    st.markdown("**Unmet demand**")
+                    st.dataframe(pd.DataFrame(allocation["unmet_demand"]).T, width="stretch")
                 st.metric("Weighted unmet critical-care risk", f"{allocation['total_unmet_critical_care_risk']:.2f}")
             except (ValueError, RuntimeError) as error:
                 st.error(str(error))
