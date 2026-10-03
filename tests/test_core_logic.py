@@ -83,6 +83,12 @@ class CoreLogicTests(unittest.TestCase):
         required = {"city", "latitude", "longitude", "pm25", "AOD_047", "NO2_density", "temperature", "relative_humidity", "wind_speed", "pblh", "atmospheric_stagnation_index", "thermal_confinement_ratio", "photochemical_pm25_proxy", "hygroscopic_growth_factor", "lag_24h", "lag_48h"}
         self.assertTrue(required.issubset(frame.columns))
 
+    def test_demo_data_has_sufficient_24h_hour_coverage(self):
+        frame = demo_data()
+        lahore = summarize_city_pm25(frame, "Lahore")
+        self.assertGreaterEqual(lahore.trailing_24h_hour_count, 18)
+        self.assertIsNotNone(lahore.trailing_24h_mean)
+
     def test_exposure_summary_uses_latest_timestamp_and_coverage_checked_mean(self):
         import pandas as pd
 

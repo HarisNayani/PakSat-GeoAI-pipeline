@@ -63,14 +63,19 @@ def load_model(path: str) -> dict[str, Any] | None:
 
 @st.cache_data
 def demo_data() -> pd.DataFrame:
-    """Provide a transparent local fallback while remote sensors are unavailable."""
-    rows = [
-        {
-            "city": "Lahore",
-            "timestamp": "2026-09-03T10:00:00Z",
+    """Provide a transparent local fallback while remote sensors are unavailable.
+
+    The synthetic demo covers a full trailing 24-hour window so the dashboard can
+    show a meaningful trailing mean rather than always flagging the metric as
+    insufficient for a one-timestamp fallback.
+    """
+    end_time = pd.Timestamp("2026-09-03T10:00:00Z")
+    timestamps = pd.date_range(end=end_time, periods=24, freq="h")
+    city_profiles = {
+        "Lahore": {
             "latitude": 31.5204,
             "longitude": 74.3587,
-            "pm25": 118.0,
+            "baseline_pm25": 118.0,
             "AOD_047": 0.92,
             "NO2_density": 0.72,
             "temperature": 31.5,
@@ -78,19 +83,11 @@ def demo_data() -> pd.DataFrame:
             "wind_speed": 2.1,
             "wind_direction_degrees": 315.0,
             "pblh": 480.0,
-            "atmospheric_stagnation_index": 1000.0 / (2.1 * 480.0 + 1.0),
-            "thermal_confinement_ratio": 31.5 / (480.0 / 100.0),
-            "photochemical_pm25_proxy": 0.72 * 31.5 * 0.92,
-            "hygroscopic_growth_factor": 1.0 / (1.0 - 0.72),
-            "lag_24h": 86.0,
-            "lag_48h": 78.0,
         },
-        {
-            "city": "Karachi",
-            "timestamp": "2026-09-03T10:00:00Z",
+        "Karachi": {
             "latitude": 24.8607,
             "longitude": 67.0011,
-            "pm25": 74.0,
+            "baseline_pm25": 74.0,
             "AOD_047": 0.48,
             "NO2_density": 0.38,
             "temperature": 30.2,
@@ -98,19 +95,11 @@ def demo_data() -> pd.DataFrame:
             "wind_speed": 4.2,
             "wind_direction_degrees": 230.0,
             "pblh": 680.0,
-            "atmospheric_stagnation_index": 1000.0 / (4.2 * 680.0 + 1.0),
-            "thermal_confinement_ratio": 30.2 / (680.0 / 100.0),
-            "photochemical_pm25_proxy": 0.38 * 30.2 * 0.48,
-            "hygroscopic_growth_factor": 1.0 / (1.0 - 0.67),
-            "lag_24h": 63.0,
-            "lag_48h": 58.0,
         },
-        {
-            "city": "Islamabad",
-            "timestamp": "2026-09-03T10:00:00Z",
+        "Islamabad": {
             "latitude": 33.6844,
             "longitude": 73.0479,
-            "pm25": 41.0,
+            "baseline_pm25": 41.0,
             "AOD_047": 0.32,
             "NO2_density": 0.24,
             "temperature": 27.8,
@@ -118,14 +107,46 @@ def demo_data() -> pd.DataFrame:
             "wind_speed": 6.1,
             "wind_direction_degrees": 45.0,
             "pblh": 860.0,
-            "atmospheric_stagnation_index": 1000.0 / (6.1 * 860.0 + 1.0),
-            "thermal_confinement_ratio": 27.8 / (860.0 / 100.0),
-            "photochemical_pm25_proxy": 0.24 * 27.8 * 0.32,
-            "hygroscopic_growth_factor": 1.0 / (1.0 - 0.55),
-            "lag_24h": 37.0,
-            "lag_48h": 32.0,
         },
-    ]
+    }
+
+    rows: list[dict[str, Any]] = []
+    for city, profile in city_profiles.items():
+        for hour_index, timestamp in enumerate(timestamps):
+            wave = np.sin((hour_index / 23) * np.pi * 2.0)
+            pm25 = profile["baseline_pm25"] + (wave * 12.0) + ((hour_index % 5) - 2.0) * 4.0
+            temperature = profile["temperature"] + (wave * 3.0)
+            humidity = profile["relative_humidity"] + (wave * 0.08)
+            wind_speed = max(profile["wind_speed"] + (wave * 1.5), 0.5)
+            aod = max(profile["AOD_047"] + (wave * 0.12), 0.05)
+            no2 = max(profile["NO2_density"] + (wave * 0.08), 0.05)
+            pblh = profile["pblh"] + (wave * 35.0)
+            atmospheric_stagnation_index = 1000.0 / (wind_speed * pblh + 1.0)
+            thermal_confinement_ratio = temperature / (pblh / 100.0)
+            photochemical_pm25_proxy = no2 * temperature * aod
+            hygroscopic_growth_factor = 1.0 / (1.0 - min(humidity, 0.95))
+            rows.append(
+                {
+                    "city": city,
+                    "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
+                    "latitude": profile["latitude"],
+                    "longitude": profile["longitude"],
+                    "pm25": float(pm25),
+                    "AOD_047": float(aod),
+                    "NO2_density": float(no2),
+                    "temperature": float(temperature),
+                    "relative_humidity": float(min(max(humidity, 0.0), 0.99)),
+                    "wind_speed": float(wind_speed),
+                    "wind_direction_degrees": float(profile["wind_direction_degrees"] + (wave * 25.0)),
+                    "pblh": float(pblh),
+                    "atmospheric_stagnation_index": float(atmospheric_stagnation_index),
+                    "thermal_confinement_ratio": float(thermal_confinement_ratio),
+                    "photochemical_pm25_proxy": float(photochemical_pm25_proxy),
+                    "hygroscopic_growth_factor": float(hygroscopic_growth_factor),
+                    "lag_24h": float(max(pm25 * 0.84, 0.0)),
+                    "lag_48h": float(max(pm25 * 0.73, 0.0)),
+                }
+            )
     return pd.DataFrame(rows)
 
 
